@@ -37,13 +37,13 @@ import {
   readAntigravityPendingReply,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
+import { extractAntigravityElicitationForm } from "../../provider/acp/AntigravityElicitationForm.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
   antigravityToolOutlivesPrompt,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
-  extractAntigravityElicitationForm,
   extractAntigravityUserInputQuestion,
   makeAntigravityReadRepair,
   makeAntigravityUserInputResponse,
