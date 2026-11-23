@@ -15,6 +15,46 @@ class UserInputAttachmentError extends Schema.TaggedError<UserInputAttachmentErr
 
 const quoteReference = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 
+const USER_INPUT_ATTACHMENT_LINE =
+  /^Attached (?:image|file) ("(?:\\.|[^"\\\r\n])*"): ("(?:\\.|[^"\\\r\n])*")(?: \(text extracted to: ("(?:\\.|[^"\\\r\n])*")\))?$/;
+
+function isJsonStringLiteral(value: string): boolean {
+  try {
+    return typeof JSON.parse(value) === "string";
+  } catch {
+    return false;
+  }
+}
+
+function isUserInputAttachmentLine(line: string): boolean {
+  const match = USER_INPUT_ATTACHMENT_LINE.exec(line);
+  if (match === null) return false;
+  const [, name, filePath, extracted] = match;
+  return (
+    name !== undefined &&
+    filePath !== undefined &&
+    isJsonStringLiteral(name) &&
+    isJsonStringLiteral(filePath) &&
+    (extracted === undefined || isJsonStringLiteral(extracted))
+  );
+}
+
+/** True when `value` consists solely of lines formatted by `appendUserInputAttachmentPaths`. */
+export function isUserInputAttachmentReference(value: string): boolean {
+  return value.length > 0 && value.split("\n").every(isUserInputAttachmentLine);
+}
+
+/** Splits `<answer>\n\n<attachments>` appended by `appendUserInputAttachmentPaths`. */
+export function splitUserInputAttachmentSuffix(
+  value: string,
+): { readonly answer: string; readonly attachments: string } | undefined {
+  const splitAt = value.lastIndexOf("\n\n");
+  if (splitAt < 0) return undefined;
+  const attachments = value.slice(splitAt + 2);
+  if (!isUserInputAttachmentReference(attachments)) return undefined;
+  return { answer: value.slice(0, splitAt), attachments };
+}
+
 /** Keep provider answer protocols unchanged; paths refer to files on the provider's server. */
 export const appendUserInputAttachmentPaths = Effect.fn("appendUserInputAttachmentPaths")(
   function* (input: {

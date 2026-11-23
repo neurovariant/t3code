@@ -3,11 +3,13 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   ChatFileAttachment,
+  ChatImageAttachment,
   MessageId,
   NodeId,
   ProjectId,
   ProviderInstanceId,
   ProviderSessionId,
+  type ProviderUserInputAnswers,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -39,6 +41,8 @@ import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSession
 import { makeAcpAdapterV2 } from "@t3tools/provider-acp/server/adapter";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
+import * as DocumentText from "../../provider/DocumentText.ts";
+import { appendUserInputAttachmentPaths } from "../../provider/userInputAttachments.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -2502,6 +2506,426 @@ describe("AntigravityAdapterV2 session system prompt", () => {
         assert.include(sent, "through the Antigravity harness, as gemini-test-low");
         assert.notInclude(append, "systemPrompt");
         assert.include(sent, "<pull_request_linking>");
+      }).pipe(Effect.provide(layerSession)),
+  );
+});
+
+describe("AntigravityAdapterV2 elicitation forms", () => {
+  const nativeSchema = {
+    type: "object",
+    properties: {
+      q1: {
+        type: "array",
+        title: "Which scopes?",
+        items: {
+          anyOf: [
+            { const: "1", title: "Frontend" },
+            { const: "2", title: "Backend" },
+            { const: "3", title: "Docs" },
+          ],
+        },
+        minItems: 0,
+        maxItems: 2,
+      },
+      q1_other: {
+        type: "string",
+        title: "Other",
+        description: "Optional free-form answer to: Which scopes?",
+        enum: null,
+      },
+      q2: {
+        type: "string",
+        title: "Which HTTP 401 format?",
+        oneOf: [
+          { const: "1", title: "Main site" },
+          { const: "2", title: "Dual fields" },
+        ],
+      },
+      q2_other: {
+        type: "string",
+        title: "Other",
+        description: "Optional free-form answer to: Which HTTP 401 format?",
+      },
+    },
+  };
+
+  const runAntigravityElicitation = (input: {
+    readonly name: string;
+    readonly requestedSchema: Record<string, unknown>;
+    readonly answers: ProviderUserInputAnswers | undefined;
+  }) =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const crypto = yield* SecureRandom.SecureRandom;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const directory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: `t3-antigravity-elicit-${input.name}-`,
+      });
+      const responseLog = path.join(directory, "elicitation-responses.ndjson");
+      const instanceId = ProviderInstanceId.make(`antigravity-elicit-${input.name}`);
+      const threadId = ThreadId.make(`thread-antigravity-elicit-${input.name}`);
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (runtimeInput) =>
+          makeAntigravityAcpRuntime({
+            ...runtimeInput,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: runtimeInput.cwd,
+              env: {
+                T3_ACP_ANTIGRAVITY: "1",
+                T3_ACP_EMIT_ELICITATION: "1",
+                T3_ACP_ELICITATION_SCHEMA: JSON.stringify(input.requestedSchema),
+                T3_ACP_ELICITATION_RESPONSE_LOG_PATH: responseLog,
+              },
+            },
+          }).pipe(Effect.provideService(SecureRandom.SecureRandom, crypto)),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.undefined,
+      });
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make(`provider-session-elicit-${input.name}`),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* session.startTurn(
+        makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          modelSelection,
+          runtimePolicy,
+          now: yield* DateTime.now,
+          messageText: "Ask questions.",
+        }),
+      );
+      const first = yield* session.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "turn.terminal" ||
+            (event.type === "turn_item.updated" && event.turnItem.type === "user_input_request"),
+        ),
+        Stream.runHead,
+      );
+      assert.isTrue(first._tag === "Some");
+      const firstEvent = first._tag === "Some" ? first.value : undefined;
+      assert.isTrue(
+        firstEvent?.type === "turn_item.updated" &&
+          firstEvent.turnItem.type === "user_input_request",
+      );
+      if (
+        firstEvent?.type !== "turn_item.updated" ||
+        firstEvent.turnItem.type !== "user_input_request"
+      ) {
+        return yield* Effect.die("expected a user_input_request item");
+      }
+      const questions = firstEvent.turnItem.questions;
+      yield* session.respondToRuntimeRequest({
+        requestId: firstEvent.turnItem.requestId,
+        ...(input.answers === undefined ? {} : { answers: input.answers }),
+      });
+      yield* session.events.pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.runHead,
+      );
+      const responses = (yield* fileSystem.readFileString(responseLog))
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as unknown);
+      assert.lengthOf(responses, 1);
+      return { questions, response: responses[0] };
+    });
+
+  it("handles custom answers, malformed attachment text, empty multi-select, and cancel cases on the flavor", () => {
+    const form = flavor.extractElicitationForm?.({
+      mode: "form",
+      sessionId: "session-1",
+      message: "The agent has 2 questions.",
+      requestedSchema: nativeSchema,
+    } as EffectAcpSchema.CreateElicitationRequest);
+    assert.isDefined(form);
+
+    // Custom answers route to _other; hand-typed malformed or invalid-escape attachment text is never split.
+    const malformed = '1\n\nAttached file "example": "unfinished';
+    const invalidEscape = '1\n\nAttached file "example": "C:\\docs\\spec"';
+    assert.deepEqual(form?.respond({ q1: "Only mobile", q2: malformed }), {
+      action: "accept",
+      content: { q1_other: "Only mobile", q2_other: malformed },
+    });
+    assert.deepEqual(form?.respond({ q1: "Only mobile", q2: invalidEscape }), {
+      action: "accept",
+      content: { q1_other: "Only mobile", q2_other: invalidEscape },
+    });
+
+    // Explicit empty multi-select array (with or without attachments) preserves q1: [] when minItems is 0.
+    const validAttachment = 'Attached file "spec.txt": "C:\\\\docs\\\\spec.txt"';
+    assert.deepEqual(form?.respond({ q1: [], q2: "1" }), {
+      action: "accept",
+      content: { q1: [], q2: "1" },
+    });
+    assert.deepEqual(form?.respond({ q1: [validAttachment], q2: "1" }), {
+      action: "accept",
+      content: { q1: [], q1_other: validAttachment, q2: "1" },
+    });
+
+    // Out-of-bounds or invalid selections cancel instead of silently dropping fields into accept {}.
+    assert.deepEqual(form?.respond({ q1: ["1", "2", "3"], q2: "1" }), { action: "cancel" });
+    assert.deepEqual(form?.respond({ q1: ["999"], q2: "1" }), { action: "cancel" });
+    assert.deepEqual(form?.respond({ q1: ["1"], q2: "   " }), { action: "cancel" });
+
+    // Empty-array + attachment cancels when minItems requires at least one selection.
+    const requiredMulti = flavor.extractElicitationForm?.({
+      mode: "form",
+      sessionId: "session-1",
+      message: "The agent has a question.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          q1: { ...nativeSchema.properties.q1, minItems: 1 },
+          q1_other: nativeSchema.properties.q1_other,
+        },
+      },
+    } as EffectAcpSchema.CreateElicitationRequest);
+    assert.deepEqual(requiredMulti?.respond({ q1: [validAttachment] }), { action: "cancel" });
+    assert.deepEqual(requiredMulti?.respond({ q1: validAttachment }), {
+      action: "accept",
+      content: { q1_other: validAttachment },
+    });
+
+    // Leading whitespace in titles, numeric q<N> ordering, blank/multiline option values, and allowOther fallback.
+    const edgeForm = flavor.extractElicitationForm?.({
+      mode: "form",
+      sessionId: "session-1",
+      message: "The agent has 3 questions.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          q1: {
+            type: "string",
+            title: "  Leading space prompt?",
+            oneOf: [
+              { const: "", title: "Blank value" },
+              { const: "a\n\nb", title: "Multiline value" },
+            ],
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to:   Leading space prompt?",
+          },
+          q10: { type: "string", title: "Tenth?", oneOf: [{ const: "1", title: "Yes" }] },
+          q10_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: Tenth?",
+          },
+          q2: { type: "string", title: "Second?", oneOf: [{ const: "1", title: "Yes" }] },
+          q2_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: Second?",
+          },
+        },
+      },
+    } as EffectAcpSchema.CreateElicitationRequest);
+    assert.deepEqual(
+      edgeForm?.questions.map((question) => [question.id, question.header, question.question]),
+      [
+        ["q1", "Question 1", "Leading space prompt?"],
+        ["q2", "Question 2", "Second?"],
+        ["q10", "Question 3", "Tenth?"],
+      ],
+    );
+    assert.deepEqual(edgeForm?.respond({ q1: "", q2: "1", q10: "1" }), {
+      action: "accept",
+      content: { q1: "", q2: "1", q10: "1" },
+    });
+    assert.deepEqual(edgeForm?.respond({ q1: `a\n\nb\n\n${validAttachment}`, q2: "1", q10: "1" }), {
+      action: "accept",
+      content: { q1: "a\n\nb", q1_other: validAttachment, q2: "1", q10: "1" },
+    });
+
+    // Forms with required primary fields or explicit cognition.ai/allowOther stay on generic ACP fallback.
+    assert.isUndefined(
+      flavor.extractElicitationForm?.({
+        mode: "form",
+        sessionId: "session-1",
+        message: "The agent has 2 questions.",
+        requestedSchema: { ...nativeSchema, required: ["q1"] },
+      } as EffectAcpSchema.CreateElicitationRequest),
+    );
+    assert.isUndefined(
+      flavor.extractElicitationForm?.({
+        mode: "form",
+        sessionId: "session-1",
+        message: "The agent has 2 questions.",
+        requestedSchema: nativeSchema,
+        _meta: { "cognition.ai/allowOther": true },
+      } as EffectAcpSchema.CreateElicitationRequest),
+    );
+  });
+
+  it.live(
+    "folds native ask_question forms over real ACP stdio with producer-formatted attachments, cancel, and intact MCP fallback",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-elicit-attachments-",
+        });
+        const shotAttachment = ChatImageAttachment.make({
+          type: "image",
+          id: "shot-1",
+          name: 'quote "shot".png',
+          mimeType: "image/png",
+          sizeBytes: 3,
+        });
+        const specAttachment = ChatFileAttachment.make({
+          type: "file",
+          id: "spec-1",
+          name: "spec.docx",
+          mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          sizeBytes: 4,
+        });
+        const shotPath = path.join(attachmentsDir, "shot-1.png");
+        const specPath = path.join(attachmentsDir, "spec-1.docx");
+        const specExtractedPath = `${specPath}.txt`;
+        yield* fileSystem.writeFileString(shotPath, "png");
+        yield* fileSystem.writeFileString(specPath, "docx");
+        yield* fileSystem.writeFileString(specExtractedPath, "extracted");
+
+        const attachedAnswers = yield* appendUserInputAttachmentPaths({
+          answers: { q1: ["1", "3"], q2: "2" },
+          attachmentsByQuestionId: {
+            q1: [shotAttachment, specAttachment],
+            q2: [shotAttachment],
+          },
+          attachmentsDir,
+        }).pipe(
+          Effect.provideService(DocumentText.DocumentText, {
+            ensure: (targetPath) =>
+              Effect.succeed(targetPath === specPath ? specExtractedPath : undefined),
+          }),
+        );
+
+        const [native, invalid, dismissed, ordinaryMcp] = yield* Effect.all(
+          [
+            runAntigravityElicitation({
+              name: "native",
+              requestedSchema: nativeSchema,
+              answers: attachedAnswers,
+            }),
+            runAntigravityElicitation({
+              name: "invalid",
+              requestedSchema: nativeSchema,
+              answers: { q1: ["1", "2", "3"], q2: "1" },
+            }),
+            runAntigravityElicitation({
+              name: "dismissed",
+              requestedSchema: nativeSchema,
+              answers: undefined,
+            }),
+            runAntigravityElicitation({
+              name: "mcp",
+              requestedSchema: {
+                type: "object",
+                properties: {
+                  region: {
+                    type: "string",
+                    title: "Region",
+                    oneOf: [
+                      { const: "us", title: "US" },
+                      { const: "eu", title: "EU" },
+                    ],
+                  },
+                  region_other: {
+                    type: "string",
+                    title: "Other",
+                    description: "Additional failover notes",
+                  },
+                  label: {
+                    type: "string",
+                    title: "Backup label",
+                  },
+                },
+              },
+              answers: { region: "eu", region_other: "Prefer Frankfurt", label: "nightly" },
+            }),
+          ],
+          { concurrency: "unbounded" },
+        );
+
+        assert.deepEqual(native.questions, [
+          {
+            id: "q1",
+            header: "Question 1",
+            question: "Which scopes?",
+            multiSelect: true,
+            options: [
+              { value: "1", label: "Frontend", description: "Frontend" },
+              { value: "2", label: "Backend", description: "Backend" },
+              { value: "3", label: "Docs", description: "Docs" },
+            ],
+          },
+          {
+            id: "q2",
+            header: "Question 2",
+            question: "Which HTTP 401 format?",
+            options: [
+              { value: "1", label: "Main site", description: "Main site" },
+              { value: "2", label: "Dual fields", description: "Dual fields" },
+            ],
+          },
+        ]);
+        const expectedShotRef = `Attached image ${JSON.stringify(shotAttachment.name)}: ${JSON.stringify(shotPath)}`;
+        const expectedSpecRef = `Attached file ${JSON.stringify(specAttachment.name)}: ${JSON.stringify(specPath)} (text extracted to: ${JSON.stringify(specExtractedPath)})`;
+        assert.deepEqual(native.response, {
+          action: "accept",
+          content: {
+            q1: ["1", "3"],
+            q1_other: `${expectedShotRef}\n${expectedSpecRef}`,
+            q2: "2",
+            q2_other: expectedShotRef,
+          },
+        });
+        assert.deepEqual(invalid.response, { action: "cancel" });
+        assert.deepEqual(dismissed.response, { action: "cancel" });
+        assert.deepEqual(
+          ordinaryMcp.questions.map((question) => [
+            question.id,
+            question.header,
+            question.question,
+          ]),
+          [
+            ["region", "Region", "Approve this request?"],
+            ["region_other", "Other", "Additional failover notes"],
+            ["label", "Backup label", "Approve this request?"],
+          ],
+        );
+        assert.deepEqual(ordinaryMcp.response, {
+          action: "accept",
+          content: { region: "eu", region_other: "Prefer Frankfurt", label: "nightly" },
+        });
       }).pipe(Effect.provide(layerSession)),
   );
 });
