@@ -7,6 +7,7 @@ import {
   NodeId,
   ProjectId,
   ProviderInstanceId,
+  type ProviderUserInputAnswers,
   ProviderSessionId,
   RunAttemptId,
   RunId,
@@ -23,6 +24,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -38,6 +40,8 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAcpAdapterV2 } from "@t3tools/provider-acp/server/adapter";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
+import * as DocumentText from "../../provider/DocumentText.ts";
+import { appendUserInputAttachmentPaths } from "../../provider/userInputAttachments.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -73,6 +77,217 @@ function permissionRequest(
     toolCall: { toolCallId, title: "Which branch?" },
   };
 }
+
+const makeElicitationRequest = (input: {
+  readonly properties: Record<string, unknown>;
+  readonly required?: ReadonlyArray<string>;
+  readonly meta?: Record<string, unknown>;
+}): EffectAcpSchema.CreateElicitationRequest =>
+  ({
+    requestId: "request-1",
+    mode: "form",
+    message: "The agent has questions.",
+    requestedSchema: {
+      type: "object",
+      properties: input.properties,
+      ...(input.required === undefined ? {} : { required: input.required }),
+    },
+    ...(input.meta === undefined ? {} : { _meta: input.meta }),
+  }) as EffectAcpSchema.CreateElicitationRequest;
+
+const choiceField = (title: string, values: ReadonlyArray<string>) => ({
+  type: "string",
+  title,
+  oneOf: values.map((value) => ({ const: value, title: value })),
+});
+
+const enumField = (title: string, values: ReadonlyArray<string>) => ({
+  type: "string",
+  title,
+  enum: values,
+});
+
+const multiChoiceField = (
+  title: string,
+  values: ReadonlyArray<string>,
+  minItems = 0,
+  maxItems = values.length,
+) => ({
+  type: "array",
+  title,
+  items: { anyOf: values.map((value) => ({ const: value, title: value })) },
+  minItems,
+  maxItems,
+});
+
+const companionField = (title: string) => ({
+  type: "string",
+  title: "Other",
+  description: `Optional free-form answer to: ${title}`,
+});
+
+describe("AntigravityAdapterV2 elicitation forms", () => {
+  it("folds paired choices, orders numerically, and routes answers", () => {
+    const attachment = 'Attached file "spec.txt": "/tmp/spec.txt"';
+    const form = flavor.extractElicitationForm?.(
+      makeElicitationRequest({
+        properties: {
+          q10_other: companionField("Which tenth?"),
+          q10: enumField("Which tenth?", [""]),
+          q1_other: companionField("Which first?"),
+          q1: choiceField("Which first?", ["a\n\nb"]),
+          q2_other: companionField("Which second?"),
+          q2: multiChoiceField("Which second?", ["1", "2"], 0, 2),
+        },
+      }),
+    );
+    assert.isDefined(form);
+    assert.deepEqual(
+      form?.questions.map(({ id, header, question, allowCustomAnswer, multiSelect }) => ({
+        id,
+        header,
+        question,
+        allowCustomAnswer,
+        multiSelect,
+      })),
+      [
+        {
+          id: "q1",
+          header: "Question 1",
+          question: "Which first?",
+          allowCustomAnswer: undefined,
+          multiSelect: undefined,
+        },
+        {
+          id: "q2",
+          header: "Question 2",
+          question: "Which second?",
+          allowCustomAnswer: undefined,
+          multiSelect: true,
+        },
+        {
+          id: "q10",
+          header: "Question 3",
+          question: "Which tenth?",
+          allowCustomAnswer: undefined,
+          multiSelect: undefined,
+        },
+      ],
+    );
+    assert.deepEqual(
+      form?.respond({
+        q1: "a\n\nb\n\n" + attachment,
+        q2: ["1", attachment],
+        q10: "",
+      }),
+      {
+        action: "accept",
+        content: {
+          q1: "a\n\nb",
+          q1_other: attachment,
+          q2: ["1"],
+          q2_other: attachment,
+          q10: "",
+        },
+      },
+    );
+    assert.deepEqual(form?.respond({ q1: "a\n\nb", q2: [], q10: "" }), {
+      action: "accept",
+      content: { q1: "a\n\nb", q2: [], q10: "" },
+    });
+    assert.deepEqual(
+      form?.respond({ q1: 'a\n\nb\n\nAttached file "incomplete', q2: [], q10: "" }),
+      {
+        action: "accept",
+        content: {
+          q1_other: 'a\n\nb\n\nAttached file "incomplete',
+          q2: [],
+          q10: "",
+        },
+      },
+    );
+    assert.deepEqual(form?.respond({ q1: "   ", q2: [], q10: "" }), { action: "cancel" });
+  });
+
+  it("rejects attachment-only multi-select answers when a selection is required", () => {
+    const attachment = 'Attached image "shot.png": "/tmp/shot.png"';
+    const form = flavor.extractElicitationForm?.(
+      makeElicitationRequest({
+        properties: {
+          q1: choiceField("Which first?", ["1"]),
+          q1_other: companionField("Which first?"),
+          q2: multiChoiceField("Which second?", ["1", "2"], 1, 2),
+          q2_other: companionField("Which second?"),
+        },
+      }),
+    );
+    assert.isDefined(form);
+    assert.deepEqual(form?.respond({ q1: "1", q2: [attachment] }), { action: "cancel" });
+  });
+
+  it("keeps standalone free-form questions in numeric order", () => {
+    const form = flavor.extractElicitationForm?.(
+      makeElicitationRequest({
+        properties: {
+          q3: choiceField("Third choice", ["3"]),
+          q3_other: companionField("Third choice"),
+          q1: choiceField("First choice", ["1"]),
+          q1_other: companionField("First choice"),
+          q2_other: { type: "string", title: "Second choice" },
+        },
+      }),
+    );
+    assert.isDefined(form);
+    assert.deepEqual(
+      form?.questions.map(({ id, required, options }) => ({ id, required, options })),
+      [
+        { id: "q1", required: undefined, options: [{ label: "1", description: "1", value: "1" }] },
+        { id: "q2_other", required: false, options: [] },
+        { id: "q3", required: undefined, options: [{ label: "3", description: "3", value: "3" }] },
+      ],
+    );
+    assert.deepEqual(form?.respond({ q1: "1", q2_other: "typed", q3: "3" }), {
+      action: "accept",
+      content: { q1: "1", q2_other: "typed", q3: "3" },
+    });
+    assert.deepEqual(form?.respond({ q1: "1", q3: "3" }), {
+      action: "accept",
+      content: { q1: "1", q3: "3" },
+    });
+    assert.deepEqual(form?.respond({ q1: "1", q2_other: "", q3: "3" }), {
+      action: "accept",
+      content: { q1: "1", q2_other: "", q3: "3" },
+    });
+  });
+
+  it("falls back for ordinary, required, and malformed forms", () => {
+    const paired = {
+      q1: choiceField("First choice", ["1"]),
+      q1_other: companionField("First choice"),
+    };
+    const cases = [
+      { properties: paired, required: ["q1"] },
+      { properties: paired, required: ["q1_other"] },
+      { properties: paired, meta: { "cognition.ai/allowOther": true } },
+      { properties: { ...paired, q1: { ...paired.q1, description: "unexpected" } } },
+      {
+        properties: {
+          q1: paired.q1,
+          q1_other: {
+            type: "string",
+            title: "Not other",
+            description: "Optional free-form answer to: First choice",
+          },
+        },
+      },
+      { properties: { q1_other: { type: "string", title: "First choice" } } },
+      { properties: { region: enumField("Region", ["us"]) } },
+    ];
+    for (const input of cases) {
+      assert.isUndefined(flavor.extractElicitationForm?.(makeElicitationRequest(input)));
+    }
+  });
+});
 
 describe("AntigravityAdapterV2 flavor", () => {
   it("keeps a successful subagent launch running until the parent turn becomes idle", () => {
@@ -160,6 +375,7 @@ describe("AntigravityAdapterV2 flavor", () => {
 });
 
 const layerSession = Layer.mergeAll(
+  DocumentText.layer.pipe(Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   NodeServices.layer,
   NodeCrypto.layer,
   IdAllocator.layer,
@@ -168,6 +384,213 @@ const layerSession = Layer.mergeAll(
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   ),
 );
+
+const runAntigravityElicitation = (input: {
+  readonly name: string;
+  readonly requestedSchema: Record<string, unknown>;
+  readonly answer: (
+    questions: ReadonlyArray<import("@t3tools/contracts").OrchestrationV2UserInputQuestion>,
+  ) => ProviderUserInputAnswers | undefined;
+}) =>
+  Effect.gen(function* () {
+    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const crypto = yield* SecureRandom.SecureRandom;
+    const mockAgentPath = yield* path.fromFileUrl(
+      new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+    );
+    const directory = yield* fileSystem.makeTempDirectoryScoped({
+      prefix: `t3-antigravity-form-${input.name}-`,
+    });
+    const responseLog = path.join(directory, "responses.jsonl");
+    const instanceId = ProviderInstanceId.make(`antigravity-form-${input.name}`);
+    const adapter = yield* makeAntigravityAdapterV2({
+      instanceId,
+      selfInvocation: yield* resolveSelfInvocation(),
+      makeRuntime: (runtimeInput) =>
+        makeAntigravityAcpRuntime({
+          ...runtimeInput,
+          childProcessSpawner,
+          spawn: {
+            command: process.execPath,
+            args: [mockAgentPath],
+            cwd: runtimeInput.cwd,
+            env: {
+              T3_ACP_ANTIGRAVITY: "1",
+              T3_ACP_EMIT_ELICITATION: "1",
+              T3_ACP_ELICITATION_SCHEMA: JSON.stringify(input.requestedSchema),
+              T3_ACP_ELICITATION_RESPONSE_LOG_PATH: responseLog,
+            },
+          },
+        }).pipe(Effect.provideService(SecureRandom.SecureRandom, crypto)),
+      withProcess: (_stop, task) => task,
+      defaultModel: Effect.undefined,
+    });
+    const threadId = ThreadId.make(`thread-antigravity-form-${input.name}`);
+    const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      cwd: process.cwd(),
+    });
+    const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+    const runtime = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make(`provider-session-antigravity-form-${input.name}`),
+      modelSelection,
+      runtimePolicy,
+    });
+    const providerThread = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
+    yield* runtime.startTurn(
+      makeTurnInput({
+        threadId,
+        providerThread,
+        instanceId,
+        modelSelection,
+        runtimePolicy,
+        now: yield* DateTime.now,
+      }),
+    );
+    const first = Option.getOrThrow(
+      yield* runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "turn.terminal" ||
+            (event.type === "turn_item.updated" && event.turnItem.type === "user_input_request"),
+        ),
+        Stream.runHead,
+      ),
+    );
+    if (first.type === "turn_item.updated" && first.turnItem.type === "user_input_request") {
+      const answers = input.answer(first.turnItem.questions);
+      yield* runtime.respondToRuntimeRequest({
+        requestId: first.turnItem.requestId,
+        ...(answers === undefined ? {} : { answers }),
+      });
+      yield* runtime.events.pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.runHead,
+      );
+    }
+    const responses = (yield* fileSystem.readFileString(responseLog))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as unknown);
+    assert.lengthOf(responses, 1);
+    return {
+      questions:
+        first.type === "turn_item.updated" && first.turnItem.type === "user_input_request"
+          ? first.turnItem.questions
+          : undefined,
+      response: responses[0],
+    };
+  });
+
+describe("AntigravityAdapterV2 native elicitation round trip", () => {
+  it.live("folds native forms and routes attachment references", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-antigravity-form-files-",
+      });
+      yield* fileSystem.writeFileString(path.join(directory, "shot-1.png"), "image");
+      yield* fileSystem.writeFileString(path.join(directory, "spec-1.txt"), "spec");
+      const prepared = yield* appendUserInputAttachmentPaths({
+        answers: { q1: ["1", "3"], q2: "2" },
+        attachmentsDir: directory,
+        attachmentsByQuestionId: {
+          q1: [
+            { type: "image", id: "shot-1", name: "shot.png", mimeType: "image/png", sizeBytes: 5 },
+            { type: "file", id: "spec-1", name: "spec.txt", mimeType: "text/plain", sizeBytes: 4 },
+          ],
+          q2: [
+            { type: "file", id: "spec-1", name: "spec.txt", mimeType: "text/plain", sizeBytes: 4 },
+          ],
+        },
+      });
+      const q1Answer = prepared.q1;
+      const q2Answer = prepared.q2;
+      if (!Array.isArray(q1Answer) || typeof q2Answer !== "string") {
+        assert.fail("expected prepared answers for q1 and q2");
+      }
+      const q2Reference = q2Answer.slice(q2Answer.lastIndexOf("\n\n") + 2);
+      const result = yield* runAntigravityElicitation({
+        name: "native",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            q1: multiChoiceField("First", ["1", "2", "3"], 2, 2),
+            q1_other: companionField("First"),
+            q2: choiceField("Second", ["1", "2"]),
+            q2_other: companionField("Second"),
+          },
+        },
+        answer: () => prepared,
+      });
+      assert.deepEqual(result.response, {
+        action: "accept",
+        content: {
+          q1: ["1", "3"],
+          q1_other: q1Answer[2],
+          q2: "2",
+          q2_other: q2Reference,
+        },
+      });
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.live("cancels invalid counts and dismissed forms", () =>
+    Effect.gen(function* () {
+      const schema = {
+        type: "object",
+        properties: {
+          q1: multiChoiceField("First", ["1", "2"], 2, 2),
+          q1_other: companionField("First"),
+        },
+      };
+      const invalid = yield* runAntigravityElicitation({
+        name: "invalid-count",
+        requestedSchema: schema,
+        answer: () => ({ q1: ["1"] }),
+      });
+      assert.deepEqual(invalid.response, { action: "cancel" });
+      const dismissed = yield* runAntigravityElicitation({
+        name: "dismissed",
+        requestedSchema: schema,
+        answer: () => undefined,
+      });
+      assert.deepEqual(dismissed.response, { action: "cancel" });
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.live("keeps ordinary MCP forms unfolded", () =>
+    Effect.gen(function* () {
+      const result = yield* runAntigravityElicitation({
+        name: "ordinary",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            region: enumField("Region", ["us", "eu"]),
+            region_other: { type: "string", title: "Other" },
+            label: { type: "string", title: "Label" },
+          },
+        },
+        answer: (questions) => {
+          assert.deepEqual(
+            questions.map((question) => question.id),
+            ["region", "region_other", "label"],
+          );
+          return { region: "us", region_other: "custom", label: "test" };
+        },
+      });
+      assert.deepEqual(result.response, {
+        action: "accept",
+        content: { region: "us", region_other: "custom", label: "test" },
+      });
+    }).pipe(Effect.provide(layerSession)),
+  );
+});
 
 describe("AntigravityAdapterV2 compaction", () => {
   it.live.each([

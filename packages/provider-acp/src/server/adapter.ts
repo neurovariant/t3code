@@ -104,6 +104,7 @@ import {
   unknownRecord,
 } from "./clientPolicy.ts";
 import { parseElicitationForm } from "./elicitationForm.ts";
+export { parseElicitationForm };
 import {
   makeAcpClientTerminals,
   resolveEmbeddedTerminalContent,

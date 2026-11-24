@@ -38,12 +38,12 @@ import {
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
+import { extractAntigravityElicitationForm } from "../../provider/acp/AntigravityElicitationForm.ts";
 import {
   antigravityApprovalOptions,
   antigravityToolOutlivesPrompt,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
-  extractAntigravityElicitationForm,
   extractAntigravityUserInputQuestion,
   makeAntigravityReadRepair,
   makeAntigravityUserInputResponse,
